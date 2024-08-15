@@ -11,10 +11,10 @@ abs_path = '/media/sien/DATA/DATA/dataset/korean_summary'
 spesific_path = 'korean_lang'
 data_dir = os.path.join(abs_path, spesific_path)
 
-tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+tokenizer = AutoTokenizer.from_pretrained("KETI-AIR/ke-t5-small")
 eos_ids = tokenizer.eos_token_id
 print("EOS Token ID:", eos_ids)
-tokenizer.pad_token = tokenizer.eos_token
+#tokenizer.pad_token = tokenizer.eos_token
 
 def get_data(path: str):
     '''

@@ -25,131 +25,94 @@ print(cfg)
 
 scaler = torch.cuda.amp.GradScaler(enabled=(cfg.dtype == 'float16'))
 
-model_args = dict(n_layer=cfg.n_layer, n_head=cfg.n_head, n_embd=cfg.embedding_depth, block_size=cfg.block_size,
+'''model_args = dict(n_layer=cfg.n_layer, n_head=cfg.n_head, n_embd=cfg.embedding_depth, block_size=cfg.block_size,
                   bias=cfg.bias, vocab_size=50257, dropout=cfg.dropout)
 gptconf = GPTConfig(**model_args)
 print(model_args)
 model = GPT(gptconf)
 model = model.to(cfg.device)
+'''
 
+from transformers import T5Tokenizer, T5ForConditionalGeneration
+from dataset import Korean_Dataset
+from utils import *
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import os
 
-optimizer = model.configure_optimizers(cfg.weight_decay, cfg.lr, (cfg.beta1, cfg.beta2), cfg.device)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+model = T5ForConditionalGeneration.from_pretrained("KETI-AIR/ke-t5-small")
+#model_custom_config = model.config
+model = model.to('cuda')
+
+# cfg.weight_decay, cfg.lr, (cfg.beta1, cfg.beta2), cfg.device
+optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=[cfg.beta1, cfg.beta2])
+train_x, test_x, train_y, test_y = preprocessing(get_data(data_dir))
+
+train_ds = Korean_Dataset(train_x, train_y)
+val_ds = Korean_Dataset(test_x, test_y)
+
+train_loader = DataLoader(train_ds, batch_size=6, pin_memory=True, num_workers=8)
+val_loader = DataLoader(val_ds, batch_size=6, pin_memory=True, num_workers=8)
 if cfg.compile:
     print("compiling the model... (시간이 좀 걸려요..)")
     unoptimized_model = model
     model = torch.compile(model)
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[cfg.dtype]
 ctx = nullcontext() if cfg.device == 'cpu' else torch.amp.autocast(device_type=cfg.device, dtype=ptdtype)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join('/media/sien/DATA/CODE/2024/llm/nanoGPT/data/shakespeare', 'train.bin'),
-                         dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join('/media/sien/DATA/CODE/2024/llm/nanoGPT/data/shakespeare', 'val.bin'),
-                         dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - cfg.block_size, (cfg.batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i + cfg.block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i + 1:i + 1 + cfg.block_size]).astype(np.int64)) for i in ix])
-    if cfg.device == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(cfg.device, non_blocking=True), y.pin_memory().to(cfg.device, non_blocking=True)
-    else:
-        x, y = x.to(cfg.device), y.to(cfg.device)
-    return x, y
+
 
 @torch.no_grad()
-def estimate_loss():
-    out = {}
+def cal_loss():
+    val_iter = 0
     model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(cfg.eval_interval)
-        for k in range(cfg.eval_interval):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+    losses = []
+    for dic in tqdm(val_loader):
+        x = dic['input_ids'].to('cuda')
+        y = dic['labels'].to('cuda')
+        attention_mask = dic['attention_mask'].to('cuda')
+        with torch.cuda.amp.autocast(enabled=(cfg.dtype == 'float16')):
+            outputs = model(input_ids=x, labels=y, attention_mask=attention_mask)
+            loss = outputs.loss
+        losses.append(loss)
+        val_iter += 1
+        if val_iter == 50:
+            model.train()
+            print(f'val loss : {sum(losses) / len(losses)}')
+            return sum(losses) / len(losses)
     model.train()
-    return out
+    print(f'val loss : {sum(losses) / len(losses)}')
+    return sum(losses) / len(losses)
 
 
-X, Y = get_batch('train')  # fetch the very first batch
-t0 = time.time()
-local_iter_num = 0  # number of iterations in the lifetime of this process
-raw_model = model  # unwrap DDP container if needed
-running_mfu = -1.0
-
-# training loop
-X, Y = get_batch('train')  # fetch the very first batch
-t0 = time.time()
-iter_num = 0 # number of iterations in the lifetime of this process
-running_mfu = -1.0
-best_val_loss = 1e9
+i = 0
 while True:
-
-    # determine and set the learning rate for this iteration
-    lr = cfg.lr
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % cfg.eval_interval == 0 :
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
-        if losses['val'] < best_val_loss or cfg.save_model:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-
-                }
-                print(f"saving checkpoint to {cfg.out_dir}")
-                torch.save(checkpoint, os.path.join(cfg.out_dir, 'ckpt.pt'))
-
-
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(cfg.gradient_accumulation_steps):
-        with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / cfg.gradient_accumulation_steps  # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
+    i += 1
+    g_loss = []
+    for dic in tqdm(train_loader):
+        x = dic['input_ids'].to('cuda')
+        y = dic['labels'].to('cuda')
+        attention_mask = dic['attention_mask'].to('cuda')
+        with torch.cuda.amp.autocast(enabled=(cfg.dtype == 'float16')):
+            outputs = model(input_ids=x, labels=y, attention_mask=attention_mask)
+            loss = outputs.loss
         scaler.scale(loss).backward()
-    # clip the gradient
-    if cfg.gradient_clipping != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clipping)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+        if cfg.gradient_clipping > 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clipping)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+        g_loss.append(loss.item())
+    print(f"iter {i}: loss {sum(g_loss) / len(g_loss):.4f}")
 
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % cfg.log_interval == 0 :
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * cfg.gradient_accumulation_steps
-        if local_iter_num >= 5:  # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(cfg.batch_size * cfg.gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%")
-    iter_num += 1
-    local_iter_num += 1
-
-    # termination conditions
-    if iter_num > cfg.iter:
-        break
+    val_loss = cal_loss()
+    print(f"Validation loss: {val_loss:.4f}")
+    if cfg.save_model:
+        checkpoint = {
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'val_loss': val_loss
+        }
+        torch.save(checkpoint, os.path.join(cfg.out_dir, 'checkpoint.pt'))

@@ -14,9 +14,9 @@ class GPT_CONFIG:
     gradient_accumulation_steps = 40
 
     # model config
-    n_layer: int = 12
-    n_head: int = 12
-    embedding_depth: int = 768
+    n_layer: int = 6
+    n_head: int = 8
+    embedding_depth: int = 256
     bias: bool = False
     dropout = 0.0
 
